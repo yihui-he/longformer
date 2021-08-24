@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoConfig
-from transformers.optimization import get_linear_schedule_with_warmup, Adafactor
+from transformers.optimization import get_linear_schedule_with_warmup, Adafactor, get_polynomial_decay_schedule_with_warmup
 import nlp
 from rouge_score import rouge_scorer
 
@@ -195,7 +195,9 @@ class Summarizer(pl.LightningModule):
             metrics.append(metric)
         logs = dict(zip(*[names, metrics]))
         print(logs)
-        return {'avg_val_loss': logs['vloss'], 'log': logs, 'progress_bar': logs}
+        #return {'avg_val_loss': logs['vloss'], 'log': logs, 'progress_bar': logs}
+        #TODO
+        return {'rouge1': logs['rouge1'], 'log': logs, 'progress_bar': logs}
 
     def test_step(self, batch, batch_nb):
         return self.validation_step(batch, batch_nb)
@@ -213,9 +215,15 @@ class Summarizer(pl.LightningModule):
             return optimizer  # const LR
         num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
         num_steps = self.args.dataset_size * self.args.epochs / num_gpus / self.args.grad_accum / self.args.batch_size
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps=self.args.warmup, num_training_steps=num_steps
-        )
+        #97 * x / 8 / 4 / 1
+        if args.poly_schedule:
+            scheduler = get_polynomial_decay_schedule_with_warmup(
+                optimizer, num_warmup_steps=self.args.warmup, num_training_steps=num_steps
+            )
+        else:
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer, num_warmup_steps=self.args.warmup, num_training_steps=num_steps
+            )
         return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
 
     def _get_dataloader(self, current_dataloader, split_name, is_train):
@@ -254,11 +262,14 @@ class Summarizer(pl.LightningModule):
     @staticmethod
     def add_model_specific_args(parser, root_dir):
         parser.add_argument("--save_dir", type=str, default='summarization')
-        parser.add_argument("--save_prefix", type=str, default='test')
+        parser.add_argument("--data_dir", type=str, default=None)
+        parser.add_argument("--save_prefix", type=str, default='test_newparams_nogradcheck')
         parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
         parser.add_argument("--grad_accum", type=int, default=1, help="number of gradient accumulation steps")
-        parser.add_argument("--gpus", type=int, default=-1,
+        parser.add_argument("--gpus", type=int, default=1,
                             help="Number of gpus. 0 for CPU")
+        parser.add_argument("--dataset_size", type=int, default=None,
+                            help="number of training examples - needed to compute number of steps for the lr scheduler")
         parser.add_argument("--warmup", type=int, default=1000, help="Number of warmup steps")
         parser.add_argument("--lr", type=float, default=0.00003, help="Maximum learning rate")
         parser.add_argument("--val_every", type=float, default=1.0, help="Number of training steps between validations")
@@ -272,9 +283,9 @@ class Summarizer(pl.LightningModule):
         parser.add_argument("--max_input_len", type=int, default=512,
                             help="maximum num of wordpieces/summary. Used for training and testing")
         parser.add_argument("--test", action='store_true', help="Test only, no training")
-        parser.add_argument("--model_path", type=str, default='facebook/bart-base',
+        parser.add_argument("--model_path", type=str, default='facebook/bart-large',
                             help="Path to the checkpoint directory or model name")
-        parser.add_argument("--tokenizer", type=str, default='facebook/bart-base')
+        parser.add_argument("--tokenizer", type=str, default='facebook/bart-large')
         parser.add_argument("--no_progress_bar", action='store_true', help="no progress bar. Good for printing")
         parser.add_argument("--fp32", action='store_true', help="default is fp16. Use --fp32 to switch to fp32")
         parser.add_argument("--debug", action='store_true', help="debug run")
@@ -287,9 +298,42 @@ class Summarizer(pl.LightningModule):
         parser.add_argument("--attention_window", type=int, default=512, help="Attention window")
         parser.add_argument("--label_smoothing", type=float, default=0.0, required=False)
         parser.add_argument("--adafactor", action='store_true', help="Use adafactor optimizer")
+        parser.add_argument("--poly_schedule", action='store_true', help="Use polynomial decay")
 
         return parser
 
+
+
+
+class SummDataset(Dataset):
+    """"""
+
+    def __init__(self, source_file, target_file):
+        """
+        Args:
+            csv_file (string): Path to the csv file with annotations.
+            root_dir (string): Directory with all the images.
+            transform (callable, optional): Optional transform to be applied
+                on a sample.
+        """
+        sources = []
+        targets = []
+        with open(source_file) as inputf:
+            for line in inputf:
+                sources.append(line.strip())
+        with open(target_file) as inputf:
+            for line in inputf:
+                targets.append(line.strip())
+        assert len(sources) == len(targets)
+        self.sources = sources
+        self.targets = targets
+
+    def __len__(self):
+        return len(self.sources)
+
+    def __getitem__(self, idx):
+        sample = {"article": self.sources[idx], "abstract": self.targets[idx]}
+        return sample
 
 def main(args):
     random.seed(args.seed)
@@ -303,7 +347,14 @@ def main(args):
     else:
         model = Summarizer(args)
 
-    model.hf_datasets = nlp.load_dataset('scientific_papers', 'arxiv')
+    hf_datasets = {}
+    data_dir = args.data_dir
+    hf_datasets['train'] = SummDataset(os.path.join(data_dir, "train.source"), os.path.join(data_dir, "train.target"))
+    hf_datasets['validation'] = SummDataset(os.path.join(data_dir, "val.source"), os.path.join(data_dir, "val.target"))
+    hf_datasets['test'] = SummDataset(os.path.join(data_dir, "test.source"), os.path.join(data_dir, "test.target"))
+
+    #model.hf_datasets = nlp.load_dataset('scientific_papers', 'arxiv')
+    model.hf_datasets = hf_datasets
 
     logger = TestTubeLogger(
         save_dir=args.save_dir,
@@ -315,15 +366,16 @@ def main(args):
         filepath=os.path.join(args.save_dir, args.save_prefix, "checkpoints"),
         save_top_k=5,
         verbose=True,
-        monitor='avg_val_loss',
-        mode='min',
+        monitor='rouge1',
+        mode='max',
         period=-1,
         prefix=''
     )
 
     print(args)
 
-    args.dataset_size = 203037  # hardcode dataset size. Needed to compute number of steps for the lr scheduler
+    #args.dataset_size = 97  # hardcode dataset size. Needed to compute number of steps for the lr scheduler
+    assert args.dataset_size
 
     trainer = pl.Trainer(gpus=args.gpus, distributed_backend='ddp' if torch.cuda.is_available() else None,
                          track_grad_norm=-1,
@@ -344,11 +396,37 @@ def main(args):
                          )
     if not args.test:
         trainer.fit(model)
-    trainer.test(model)
+    if args.test:
+        split_name = 'test'
+        dataset = SummarizationDataset(hf_dataset=model.hf_datasets[split_name], tokenizer=model.tokenizer,
+                                max_input_len=model.args.max_input_len, max_output_len=model.args.max_output_len)
+        loader = DataLoader(dataset, batch_size=model.args.batch_size, shuffle=False, num_workers=model.args.num_workers, collate_fn=SummarizationDataset.collate_fn)
+        summs = []
+        golds = []
+        model.model.eval()
+        model.model.cuda()
+        for count, batch in enumerate(loader):
+            print(count)
+            input_ids, output_ids = batch
+            input_ids, attention_mask = model._prepare_input(input_ids)
+            input_ids = input_ids.to("cuda:0")
+            attention_mask = attention_mask.to("cuda:0")
+            generated_ids = model.model.generate(input_ids=input_ids,
+                                                 attention_mask=attention_mask, min_length=300, max_length=512,
+                                                num_beams=4, no_repeat_ngram_size=3)
+            generated_str = model.tokenizer.batch_decode(generated_ids.tolist(), skip_special_tokens=True)
+            gold_str = model.tokenizer.batch_decode(output_ids.tolist(), skip_special_tokens=True)
+            summs.append(generated_str[0])
+            golds.append(gold_str[0])
+        filename_out = args.from_pretrained.replace("/", "_")
+        with open(f"test.target.hypo.{filename_out}", "w") as outputf, open("test.target.gold", "w") as outputf2:
+            for (summ, gold) in zip(summs, golds):
+                outputf.write(summ.replace("\n", " ") + "\n")
+                outputf2.write(gold.replace("\n", " ") + "\n")
 
 
 if __name__ == "__main__":
-    main_arg_parser = argparse.ArgumentParser(description="summarization")
+    main_arg_parser = argparse.ArgumentParser(description="summarization_new")
     parser = Summarizer.add_model_specific_args(main_arg_parser, os.getcwd())
     args = parser.parse_args()
     main(args)
